@@ -12,11 +12,14 @@ permissions:
   contents: read
 
 env:
+  # Current upstream installer source + official signed ARM64 driver LFS object.
   UPSTREAM_REF: 2b950fd9393e1644b4199f6eb4999e1720f0c6e9
-  APPVEYOR_BUILD_VERSION: 1.7.346.0
+  # Exact source commit reported by the official AppVeyor build 1.7.346.0.
+  APP_SOURCE_REF: 22a1ff5fdce550ec789f7b229ad4c59d6709ab61
+  APP_VERSION: 1.7.346.0
   DRIVER_ZIP_SHA256: 6cb54a891918737075c091484d928919d9b9ee99a9e6cd72e9965d1d8be9cab0
-  CLIENT_SHA256: d6897421994a4bb04c28be3d36bbfbaa66a7c293f49e7ef25be18770f8db355b
-  CLI_SHA256: f2a333de98468236f6c0db0b3a130ec067a646c2023ef125155f7323b0aa51f7
+  REFERENCE_CLIENT_SHA256: d6897421994a4bb04c28be3d36bbfbaa66a7c293f49e7ef25be18770f8db355b
+  REFERENCE_CLI_SHA256: f2a333de98468236f6c0db0b3a130ec067a646c2023ef125155f7323b0aa51f7
   NEFCON_VERSION: v1.20.0
   NEFCON_ZIP_SHA256: be50bf5d66556a5577e1be1cb3c36ea6d0462d558ea8c2b3b8934e8f88ec433a
 
@@ -28,7 +31,7 @@ jobs:
       - name: Checkout packaging repository
         uses: actions/checkout@v4
 
-      - name: Checkout official HidHide source and signed LFS driver
+      - name: Checkout current official installer source and signed ARM64 driver
         uses: actions/checkout@v4
         with:
           repository: nefarius/HidHide
@@ -37,6 +40,52 @@ jobs:
           lfs: true
           submodules: false
 
+      - name: Checkout exact HidHide 1.7.346.0 application source
+        uses: actions/checkout@v4
+        with:
+          repository: nefarius/HidHide
+          ref: ${{ env.APP_SOURCE_REF }}
+          path: appsrc
+          lfs: false
+          submodules: false
+
+      - name: Configure MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build ARM64 Client and CLI from exact source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:APPVEYOR_BUILD_VERSION = $env:APP_VERSION
+
+          msbuild 'appsrc/HidHide.sln' /t:HidHideCLI:Rebuild /p:Configuration=Release /p:Platform=ARM64 /m /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "HidHideCLI ARM64 build failed: $LASTEXITCODE" }
+
+          msbuild 'appsrc/HidHide.sln' /t:HidHideClient:Rebuild /p:Configuration=Release /p:Platform=ARM64 /m /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "HidHideClient ARM64 build failed: $LASTEXITCODE" }
+
+          New-Item -ItemType Directory -Force payload | Out-Null
+          Copy-Item 'appsrc/bin/Release/ARM64/HidHideClient.exe' 'payload/HidHideClient.exe'
+          Copy-Item 'appsrc/bin/Release/ARM64/HidHideCLI.exe' 'payload/HidHideCLI.exe'
+
+          $client = Get-Item 'payload/HidHideClient.exe'
+          $cli = Get-Item 'payload/HidHideCLI.exe'
+          $clientVersion = $client.VersionInfo.ProductVersion
+          $cliVersion = $cli.VersionInfo.ProductVersion
+          Write-Host "Client version: $clientVersion"
+          Write-Host "CLI version:    $cliVersion"
+          if ($clientVersion -notlike "$env:APP_VERSION*") { throw "Unexpected Client version: $clientVersion" }
+          if ($cliVersion -notlike "$env:APP_VERSION*") { throw "Unexpected CLI version: $cliVersion" }
+
+          $clientHash = (Get-FileHash $client.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $cliHash = (Get-FileHash $cli.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "Built Client SHA256: $clientHash"
+          Write-Host "Built CLI SHA256:    $cliHash"
+          if ($clientHash -eq $env:REFERENCE_CLIENT_SHA256) { Write-Host 'Client is byte-identical to the supplied official AppVeyor artifact.' }
+          else { Write-Host 'Client differs byte-for-byte from the supplied artifact due to build environment; source commit and product version are pinned.' }
+          if ($cliHash -eq $env:REFERENCE_CLI_SHA256) { Write-Host 'CLI is byte-identical to the supplied official AppVeyor artifact.' }
+          else { Write-Host 'CLI differs byte-for-byte from the supplied artifact due to build environment; source commit and product version are pinned.' }
+
       - name: Install WiX 5.0.2
         shell: pwsh
         run: |
@@ -44,78 +93,6 @@ jobs:
           $tools = Join-Path $env:USERPROFILE '.dotnet\tools'
           $tools | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & (Join-Path $tools 'wix.exe') extension add -g WixToolset.UI.wixext/5.0.2
-
-      - name: Fetch exact ARM64 Client and CLI from official AppVeyor build
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force payload | Out-Null
-
-          $buildUrl = "https://ci.appveyor.com/api/projects/nefarius/hidhide/build/$env:APPVEYOR_BUILD_VERSION"
-          Write-Host "Querying $buildUrl"
-          $project = Invoke-RestMethod -Uri $buildUrl
-          if (-not $project.build) { throw "AppVeyor build $env:APPVEYOR_BUILD_VERSION not found." }
-          Write-Host "Build commit: $($project.build.commitId)"
-          Write-Host "Jobs: $($project.build.jobs.Count)"
-
-          $clientHit = $null
-          $cliHit = $null
-          $clientJobId = $null
-          $cliJobId = $null
-
-          foreach ($job in $project.build.jobs) {
-            Write-Host "Checking AppVeyor job: $($job.name) [$($job.jobId)]"
-            $artifacts = @(Invoke-RestMethod -Uri "https://ci.appveyor.com/api/buildjobs/$($job.jobId)/artifacts")
-            $isArmJob = ($job.name -match '(?i)ARM64')
-
-            foreach ($artifact in $artifacts) {
-              Write-Host "  artifact: $($artifact.fileName)"
-            }
-
-            if (-not $clientHit) {
-              $candidate = $artifacts | Where-Object {
-                $_.fileName -match '(?i)(^|[\\/])HidHideClient\.exe$' -and
-                (($_.fileName -match '(?i)ARM64') -or $isArmJob)
-              } | Select-Object -First 1
-              if ($candidate) {
-                $clientHit = $candidate
-                $clientJobId = $job.jobId
-              }
-            }
-
-            if (-not $cliHit) {
-              $candidate = $artifacts | Where-Object {
-                $_.fileName -match '(?i)(^|[\\/])HidHideCLI\.exe$' -and
-                (($_.fileName -match '(?i)ARM64') -or $isArmJob)
-              } | Select-Object -First 1
-              if ($candidate) {
-                $cliHit = $candidate
-                $cliJobId = $job.jobId
-              }
-            }
-          }
-
-          if (-not $clientHit) { throw 'HidHideClient.exe ARM64 artifact not found in any job.' }
-          if (-not $cliHit) { throw 'HidHideCLI.exe ARM64 artifact not found in any job.' }
-
-          function Get-AppVeyorArtifact([string]$jobId, [string]$fileName, [string]$outFile) {
-            $normalized = $fileName -replace '\\','/'
-            $escaped = ($normalized -split '/') | ForEach-Object { [Uri]::EscapeDataString($_) }
-            $artifactPath = $escaped -join '/'
-            $url = "https://ci.appveyor.com/api/buildjobs/$jobId/artifacts/$artifactPath"
-            Write-Host "Downloading $fileName from $jobId"
-            Invoke-WebRequest -Uri $url -OutFile $outFile
-          }
-
-          Get-AppVeyorArtifact $clientJobId $clientHit.fileName 'payload/HidHideClient.exe'
-          Get-AppVeyorArtifact $cliJobId $cliHit.fileName 'payload/HidHideCLI.exe'
-
-          $clientHash = (Get-FileHash 'payload/HidHideClient.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
-          $cliHash = (Get-FileHash 'payload/HidHideCLI.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
-          Write-Host "Client SHA256: $clientHash"
-          Write-Host "CLI SHA256:    $cliHash"
-          if ($clientHash -ne $env:CLIENT_SHA256) { throw "Client SHA256 mismatch: $clientHash" }
-          if ($cliHash -ne $env:CLI_SHA256) { throw "CLI SHA256 mismatch: $cliHash" }
 
       - name: Prepare official signed ARM64 driver
         shell: pwsh
@@ -173,17 +150,18 @@ jobs:
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force dist | Out-Null
           dotnet run --project upstream/Installer/HidHide.Installer.csproj -c Release -- --staging "$PWD/staging" --out "$PWD/dist" --platform ARM64
+          if ($LASTEXITCODE -ne 0) { throw "Installer builder failed: $LASTEXITCODE" }
 
           $msi = Get-ChildItem dist -Filter '*.msi' | Select-Object -First 1
           if (-not $msi) { throw 'MSI was not produced.' }
-          $final = "dist/HidHide_ARM64_$env:APPVEYOR_BUILD_VERSION.msi"
+          $final = "dist/HidHide_ARM64_$env:APP_VERSION.msi"
           if ($msi.FullName -ne (Join-Path $PWD $final)) { Move-Item $msi.FullName $final -Force }
           Get-FileHash $final -Algorithm SHA256 | Format-List
 
       - name: Upload HidHide ARM64 MSI
         uses: actions/upload-artifact@v4
         with:
-          name: HidHide_ARM64_${{ env.APPVEYOR_BUILD_VERSION }}
-          path: dist/HidHide_ARM64_${{ env.APPVEYOR_BUILD_VERSION }}.msi
+          name: HidHide_ARM64_${{ env.APP_VERSION }}
+          path: dist/HidHide_ARM64_${{ env.APP_VERSION }}.msi
           if-no-files-found: error
           compression-level: 0
