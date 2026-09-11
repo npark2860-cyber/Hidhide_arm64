@@ -1,0 +1,151 @@
+name: Build HidHide ARM64 MSI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-arm64-msi.yml'
+      - 'README.md'
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REF: 2b950fd9393e1644b4199f6eb4999e1720f0c6e9
+  APPVEYOR_BUILD_VERSION: 1.7.346.0
+  DRIVER_ZIP_SHA256: 6cb54a891918737075c091484d928919d9b9ee99a9e6cd72e9965d1d8be9cab0
+  CLIENT_SHA256: d6897421994a4bb04c28be3d36bbfbaa66a7c293f49e7ef25be18770f8db355b
+  CLI_SHA256: f2a333de98468236f6c0db0b3a130ec067a646c2023ef125155f7323b0aa51f7
+  NEFCON_VERSION: v1.20.0
+  NEFCON_ZIP_SHA256: be50bf5d66556a5577e1be1cb3c36ea6d0462d558ea8c2b3b8934e8f88ec433a
+
+jobs:
+  build-msi:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout packaging repository
+        uses: actions/checkout@v4
+
+      - name: Checkout official HidHide source and LFS driver
+        uses: actions/checkout@v4
+        with:
+          repository: nefarius/HidHide
+          ref: ${{ env.UPSTREAM_REF }}
+          path: upstream
+          lfs: true
+          submodules: recursive
+
+      - name: Install WiX 5.0.2
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          $tools = Join-Path $env:USERPROFILE '.dotnet\tools'
+          $tools | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $tools 'wix.exe') extension add -g WixToolset.UI.wixext/5.0.2
+
+      - name: Fetch exact ARM64 Client and CLI from official AppVeyor build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force payload | Out-Null
+
+          $buildUrl = "https://ci.appveyor.com/api/projects/nefarius/hidhide/build/$env:APPVEYOR_BUILD_VERSION"
+          Write-Host "Querying $buildUrl"
+          $project = Invoke-RestMethod -Uri $buildUrl
+          if (-not $project.build) { throw "AppVeyor build $env:APPVEYOR_BUILD_VERSION not found." }
+          $job = $project.build.jobs | Select-Object -First 1
+          if (-not $job.jobId) { throw 'No AppVeyor jobId found.' }
+          Write-Host "AppVeyor job: $($job.jobId)"
+
+          $artifacts = Invoke-RestMethod -Uri "https://ci.appveyor.com/api/buildjobs/$($job.jobId)/artifacts"
+          $client = $artifacts | Where-Object { $_.fileName -replace '\\','/' -eq 'bin/Release/ARM64/HidHideClient.exe' } | Select-Object -First 1
+          $cli = $artifacts | Where-Object { $_.fileName -replace '\\','/' -eq 'bin/Release/ARM64/HidHideCLI.exe' } | Select-Object -First 1
+          if (-not $client) { throw 'HidHideClient.exe ARM64 artifact not found.' }
+          if (-not $cli) { throw 'HidHideCLI.exe ARM64 artifact not found.' }
+
+          function Get-AppVeyorArtifact([string]$jobId, [string]$fileName, [string]$outFile) {
+            $escaped = [Uri]::EscapeDataString(($fileName -replace '\\','/'))
+            $url = "https://ci.appveyor.com/api/buildjobs/$jobId/artifacts/$escaped"
+            Write-Host "Downloading $fileName"
+            Invoke-WebRequest -Uri $url -OutFile $outFile
+          }
+
+          Get-AppVeyorArtifact $job.jobId $client.fileName 'payload/HidHideClient.exe'
+          Get-AppVeyorArtifact $job.jobId $cli.fileName 'payload/HidHideCLI.exe'
+
+          $clientHash = (Get-FileHash 'payload/HidHideClient.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          $cliHash = (Get-FileHash 'payload/HidHideCLI.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($clientHash -ne $env:CLIENT_SHA256) { throw "Client SHA256 mismatch: $clientHash" }
+          if ($cliHash -ne $env:CLI_SHA256) { throw "CLI SHA256 mismatch: $cliHash" }
+
+      - name: Prepare official signed ARM64 driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = 'upstream/drivers/HidHide_ARM64.zip'
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:DRIVER_ZIP_SHA256) { throw "Driver ZIP SHA256 mismatch: $hash" }
+          Expand-Archive -LiteralPath $zip -DestinationPath driver -Force
+
+          $inf = Get-ChildItem driver -Recurse -Filter 'HidHide.inf' | Select-Object -First 1
+          $sys = Get-ChildItem driver -Recurse -Filter 'HidHide.sys' | Select-Object -First 1
+          $cat = Get-ChildItem driver -Recurse -Filter '*.cat' | Where-Object { $_.Name -ieq 'HidHide.cat' } | Select-Object -First 1
+          if (-not $inf -or -not $sys -or -not $cat) { throw 'Signed ARM64 driver package is incomplete.' }
+
+          New-Item -ItemType Directory -Force staging | Out-Null
+          Copy-Item $inf.FullName 'staging/HidHide.inf'
+          Copy-Item $sys.FullName 'staging/HidHide.sys'
+          Copy-Item $cat.FullName 'staging/HidHide.cat'
+
+      - name: Fetch official ARM64 nefcon
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "https://github.com/nefarius/nefcon/releases/download/$env:NEFCON_VERSION/nefcon_$env:NEFCON_VERSION.zip"
+          Invoke-WebRequest -Uri $url -OutFile nefcon.zip
+          $hash = (Get-FileHash nefcon.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:NEFCON_ZIP_SHA256) { throw "nefcon ZIP SHA256 mismatch: $hash" }
+          Expand-Archive nefcon.zip -DestinationPath nefcon -Force
+          $nefcon = Get-ChildItem nefcon -Recurse -Filter 'nefconw.exe' | Where-Object { $_.FullName -match '[\\/]ARM64[\\/]' } | Select-Object -First 1
+          if (-not $nefcon) { throw 'ARM64 nefconw.exe not found.' }
+          Copy-Item $nefcon.FullName 'staging/nefconw.exe'
+
+      - name: Assemble MSI staging payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item 'payload/HidHideClient.exe' 'staging/HidHideClient.exe'
+          Copy-Item 'payload/HidHideCLI.exe' 'staging/HidHideCLI.exe'
+
+          Copy-Item 'upstream/HidHide/HidHide.man' 'staging/HidHide.man'
+          Copy-Item 'upstream/HidHide/HidHide.wprp' 'staging/HidHide.wprp'
+          Copy-Item 'upstream/HidHideClient/HidHideClient.man' 'staging/HidHideClient.man'
+          Copy-Item 'upstream/HidHideClient/HidHideClient.wprp' 'staging/HidHideClient.wprp'
+          Copy-Item 'upstream/HidHideCLI/HidHideCLI.man' 'staging/HidHideCLI.man'
+          Copy-Item 'upstream/HidHideCLI/HidHideCLI.wprp' 'staging/HidHideCLI.wprp'
+
+          Write-Host 'Staging payload:'
+          Get-ChildItem staging | Sort-Object Name | Format-Table Name,Length
+
+      - name: Build ARM64 MSI using official WixSharp installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          dotnet run --project upstream/Installer/HidHide.Installer.csproj -c Release -- --staging "$PWD/staging" --out "$PWD/dist" --platform ARM64
+
+          $msi = Get-ChildItem dist -Filter '*.msi' | Select-Object -First 1
+          if (-not $msi) { throw 'MSI was not produced.' }
+          $final = "dist/HidHide_ARM64_$env:APPVEYOR_BUILD_VERSION.msi"
+          if ($msi.FullName -ne (Join-Path $PWD $final)) { Move-Item $msi.FullName $final -Force }
+          Get-FileHash $final -Algorithm SHA256 | Format-List
+
+      - name: Upload HidHide ARM64 MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: HidHide_ARM64_${{ env.APPVEYOR_BUILD_VERSION }}
+          path: dist/HidHide_ARM64_${{ env.APPVEYOR_BUILD_VERSION }}.msi
+          if-no-files-found: error
+          compression-level: 0
