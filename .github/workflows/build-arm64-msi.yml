@@ -12,9 +12,7 @@ permissions:
   contents: read
 
 env:
-  # Current upstream installer source + official signed ARM64 driver LFS object.
   UPSTREAM_REF: 2b950fd9393e1644b4199f6eb4999e1720f0c6e9
-  # Exact source commit reported by the official AppVeyor build 1.7.346.0.
   APP_SOURCE_REF: 22a1ff5fdce550ec789f7b229ad4c59d6709ab61
   APP_VERSION: 1.7.346.0
   DRIVER_ZIP_SHA256: 6cb54a891918737075c091484d928919d9b9ee99a9e6cd72e9965d1d8be9cab0
@@ -25,7 +23,7 @@ env:
 
 jobs:
   build-msi:
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Checkout packaging repository
@@ -51,17 +49,29 @@ jobs:
 
       - name: Configure MSBuild
         uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+          msbuild-architecture: x64
 
       - name: Build ARM64 Client and CLI from exact source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $env:APPVEYOR_BUILD_VERSION = $env:APP_VERSION
+          $solutionDir = (Resolve-Path 'appsrc').Path + '\'
+          $common = @(
+            '/t:Rebuild',
+            '/p:Configuration=Release',
+            '/p:Platform=ARM64',
+            "/p:SolutionDir=$solutionDir",
+            '/m',
+            '/v:minimal'
+          )
 
-          msbuild 'appsrc/HidHide.sln' /t:HidHideCLI:Rebuild /p:Configuration=Release /p:Platform=ARM64 /m /v:minimal
+          & msbuild 'appsrc/HidHideCLI/HidHideCLI.vcxproj' @common
           if ($LASTEXITCODE -ne 0) { throw "HidHideCLI ARM64 build failed: $LASTEXITCODE" }
 
-          msbuild 'appsrc/HidHide.sln' /t:HidHideClient:Rebuild /p:Configuration=Release /p:Platform=ARM64 /m /v:minimal
+          & msbuild 'appsrc/HidHideClient/HidHideClient.vcxproj' @common
           if ($LASTEXITCODE -ne 0) { throw "HidHideClient ARM64 build failed: $LASTEXITCODE" }
 
           New-Item -ItemType Directory -Force payload | Out-Null
@@ -82,9 +92,9 @@ jobs:
           Write-Host "Built Client SHA256: $clientHash"
           Write-Host "Built CLI SHA256:    $cliHash"
           if ($clientHash -eq $env:REFERENCE_CLIENT_SHA256) { Write-Host 'Client is byte-identical to the supplied official AppVeyor artifact.' }
-          else { Write-Host 'Client differs byte-for-byte from the supplied artifact due to build environment; source commit and product version are pinned.' }
+          else { Write-Host 'Client differs byte-for-byte from the supplied artifact; exact source commit and product version remain pinned.' }
           if ($cliHash -eq $env:REFERENCE_CLI_SHA256) { Write-Host 'CLI is byte-identical to the supplied official AppVeyor artifact.' }
-          else { Write-Host 'CLI differs byte-for-byte from the supplied artifact due to build environment; source commit and product version are pinned.' }
+          else { Write-Host 'CLI differs byte-for-byte from the supplied artifact; exact source commit and product version remain pinned.' }
 
       - name: Install WiX 5.0.2
         shell: pwsh
