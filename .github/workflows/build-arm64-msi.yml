@@ -28,14 +28,14 @@ jobs:
       - name: Checkout packaging repository
         uses: actions/checkout@v4
 
-      - name: Checkout official HidHide source and LFS driver
+      - name: Checkout official HidHide source and signed LFS driver
         uses: actions/checkout@v4
         with:
           repository: nefarius/HidHide
           ref: ${{ env.UPSTREAM_REF }}
           path: upstream
           lfs: true
-          submodules: recursive
+          submodules: false
 
       - name: Install WiX 5.0.2
         shell: pwsh
@@ -55,33 +55,65 @@ jobs:
           Write-Host "Querying $buildUrl"
           $project = Invoke-RestMethod -Uri $buildUrl
           if (-not $project.build) { throw "AppVeyor build $env:APPVEYOR_BUILD_VERSION not found." }
-          $job = $project.build.jobs | Select-Object -First 1
-          if (-not $job.jobId) { throw 'No AppVeyor jobId found.' }
-          Write-Host "AppVeyor job: $($job.jobId)"
+          Write-Host "Build commit: $($project.build.commitId)"
+          Write-Host "Jobs: $($project.build.jobs.Count)"
 
-          $artifacts = Invoke-RestMethod -Uri "https://ci.appveyor.com/api/buildjobs/$($job.jobId)/artifacts"
-          Write-Host 'Available ARM64 executable artifacts:'
-          $artifacts | Where-Object { $_.fileName -match '(?i)ARM64' -and $_.fileName -match '(?i)\.exe$' } | ForEach-Object { Write-Host "  $($_.fileName)" }
+          $clientHit = $null
+          $cliHit = $null
+          $clientJobId = $null
+          $cliJobId = $null
 
-          $client = $artifacts | Where-Object { $_.fileName -match '(?i)ARM64' -and $_.fileName -match '(?i)(^|[\\/])HidHideClient\.exe$' } | Select-Object -First 1
-          $cli = $artifacts | Where-Object { $_.fileName -match '(?i)ARM64' -and $_.fileName -match '(?i)(^|[\\/])HidHideCLI\.exe$' } | Select-Object -First 1
-          if (-not $client) { throw 'HidHideClient.exe ARM64 artifact not found.' }
-          if (-not $cli) { throw 'HidHideCLI.exe ARM64 artifact not found.' }
+          foreach ($job in $project.build.jobs) {
+            Write-Host "Checking AppVeyor job: $($job.name) [$($job.jobId)]"
+            $artifacts = @(Invoke-RestMethod -Uri "https://ci.appveyor.com/api/buildjobs/$($job.jobId)/artifacts")
+            $isArmJob = ($job.name -match '(?i)ARM64')
+
+            foreach ($artifact in $artifacts) {
+              Write-Host "  artifact: $($artifact.fileName)"
+            }
+
+            if (-not $clientHit) {
+              $candidate = $artifacts | Where-Object {
+                $_.fileName -match '(?i)(^|[\\/])HidHideClient\.exe$' -and
+                (($_.fileName -match '(?i)ARM64') -or $isArmJob)
+              } | Select-Object -First 1
+              if ($candidate) {
+                $clientHit = $candidate
+                $clientJobId = $job.jobId
+              }
+            }
+
+            if (-not $cliHit) {
+              $candidate = $artifacts | Where-Object {
+                $_.fileName -match '(?i)(^|[\\/])HidHideCLI\.exe$' -and
+                (($_.fileName -match '(?i)ARM64') -or $isArmJob)
+              } | Select-Object -First 1
+              if ($candidate) {
+                $cliHit = $candidate
+                $cliJobId = $job.jobId
+              }
+            }
+          }
+
+          if (-not $clientHit) { throw 'HidHideClient.exe ARM64 artifact not found in any job.' }
+          if (-not $cliHit) { throw 'HidHideCLI.exe ARM64 artifact not found in any job.' }
 
           function Get-AppVeyorArtifact([string]$jobId, [string]$fileName, [string]$outFile) {
             $normalized = $fileName -replace '\\','/'
             $escaped = ($normalized -split '/') | ForEach-Object { [Uri]::EscapeDataString($_) }
             $artifactPath = $escaped -join '/'
             $url = "https://ci.appveyor.com/api/buildjobs/$jobId/artifacts/$artifactPath"
-            Write-Host "Downloading $fileName"
+            Write-Host "Downloading $fileName from $jobId"
             Invoke-WebRequest -Uri $url -OutFile $outFile
           }
 
-          Get-AppVeyorArtifact $job.jobId $client.fileName 'payload/HidHideClient.exe'
-          Get-AppVeyorArtifact $job.jobId $cli.fileName 'payload/HidHideCLI.exe'
+          Get-AppVeyorArtifact $clientJobId $clientHit.fileName 'payload/HidHideClient.exe'
+          Get-AppVeyorArtifact $cliJobId $cliHit.fileName 'payload/HidHideCLI.exe'
 
           $clientHash = (Get-FileHash 'payload/HidHideClient.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
           $cliHash = (Get-FileHash 'payload/HidHideCLI.exe' -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "Client SHA256: $clientHash"
+          Write-Host "CLI SHA256:    $cliHash"
           if ($clientHash -ne $env:CLIENT_SHA256) { throw "Client SHA256 mismatch: $clientHash" }
           if ($cliHash -ne $env:CLI_SHA256) { throw "CLI SHA256 mismatch: $cliHash" }
 
@@ -91,6 +123,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $zip = 'upstream/drivers/HidHide_ARM64.zip'
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "Driver ZIP SHA256: $hash"
           if ($hash -ne $env:DRIVER_ZIP_SHA256) { throw "Driver ZIP SHA256 mismatch: $hash" }
           Expand-Archive -LiteralPath $zip -DestinationPath driver -Force
 
